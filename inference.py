@@ -57,15 +57,14 @@ def inspect_attention(attn_module: Attention, Q: torch.Tensor, K: torch.Tensor, 
     Uses Attention.forward(), Attention.rope(), and Attention.phases_cos_sin().
     Returns attention scores and transformed values.
     """
-    # Get RoPE phases
+    # Get RoPE phases - match the implementation in Attention.forward()
     _, _, T, _ = Q.size()
-    freqs = attn_module.freqs
+    freqs = attn_module.freqs  # [1, 1, 1, N]
     r_phases = (
         torch.arange(0, T, device=freqs.device, dtype=freqs.dtype).view(1, 1, -1, 1)
-    ) * freqs
+    ) * freqs  # [1, 1, T, 1] * [1, 1, 1, N] -> [1, 1, T, N]
     
     # Apply RoPE using static method
-    phases_cos, phases_sin = Attention.phases_cos_sin(r_phases)
     QR = Attention.rope(r_phases, Q)
     KR = QR  # K == Q in BDH
     
@@ -114,7 +113,8 @@ def run_bdh_forward_step_by_step(model: BDH, idx: torch.Tensor) -> dict:
         layer_info = {"level": level}
         
         # Encoder projection
-        x_latent = x @ model.encoder  # B, nh, T, N
+        # x: [B, 1, T, D], encoder: [nh, D, N] -> x_latent: [B, nh, T, N]
+        x_latent = torch.einsum('b1td,hde->bhte', x, model.encoder)
         layer_info["x_latent_shape"] = list(x_latent.shape)
         
         # ReLU activation (sparsity)
@@ -123,17 +123,21 @@ def run_bdh_forward_step_by_step(model: BDH, idx: torch.Tensor) -> dict:
         
         # Attention (using model.attn which is bdh.Attention)
         yKV = model.attn(Q=x_sparse, K=x_sparse, V=x)
-        layer_info["yKV_shape"] = list(yKV.shape)
+        layer_info["yKV_shape_before_reduce"] = list(yKV.shape)
         
         # Inspect attention internals for first layer
         if level == 0:
             attn_details = inspect_attention(model.attn, x_sparse, x_sparse, x)
             layer_info["attention_details"] = attn_details
         
+        # Reduce from [B, nh, T, D] to [B, 1, T, D] by averaging over heads
+        yKV = yKV.mean(dim=1, keepdim=True)
+        layer_info["yKV_shape"] = list(yKV.shape)
         yKV = model.ln(yKV)
         
         # Value encoder projection
-        y_latent = yKV @ model.encoder_v
+        # yKV: [B, 1, T, D], encoder_v: [nh, D, N] -> y_latent: [B, nh, T, N]
+        y_latent = torch.einsum('b1td,hde->bhte', yKV, model.encoder_v)
         y_sparse = F.relu(y_latent)
         layer_info["y_sparse_nonzero_ratio"] = (y_sparse > 0).float().mean().item()
         

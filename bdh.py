@@ -35,16 +35,11 @@ class Attention(torch.nn.Module):
         self.config = config
         nh = config.n_head
         D = config.n_embd
-        head_dim = config.n_embd // config.n_head
-        freqs = get_freqs(n=head_dim, theta=10000
-, dtype=torch.float32)
         N = config.mlp_internal_dim_multiplier * D // nh
-        """
-        self.freqs = torch.nn.Buffer(
-            get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N) )
-        """
+        # BDH uses frequencies for the full latent dimension N, not head_dim
+        # Store as [1, 1, 1, N] to match the expected shape in forward
+        freqs = get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N)
         self.register_buffer("freqs", freqs)
-
 
     @staticmethod
     def phases_cos_sin(phases):
@@ -62,26 +57,33 @@ class Attention(torch.nn.Module):
     def forward(self, Q, K, V):
         assert self.freqs.dtype == torch.float32
         assert K is Q
+        B, nh_Q, T, _ = Q.size()
+        B_V, nh_V, T_V, D = V.size()
+        
+        # V might have shape [B, 1, T, D] while Q has [B, nh, T, N]
+        # Need to expand V to match head dimension for matrix multiplication
+        if nh_V == 1 and nh_Q > 1:
+            # Expand V from [B, 1, T, D] to [B, nh, T, D] by repeating along head dim
+            V = V.repeat(1, nh_Q, 1, 1)  # [B, nh, T, D]
 
-        B, nh, T, latent_dim = Q.shape
-        rot_dim = self.freqs.shape[0]   # ← the ONLY safe RoPE dimension
-
-        # Build RoPE phases ONLY for rot_dim
-        freqs = self.freqs.to(Q.device)                 # [rot_dim]
-        positions = torch.arange(T, device=Q.device, dtype=freqs.dtype)
-        phases = positions[:, None] * freqs[None, :]    # [T, rot_dim]
-        phases = phases.view(1, 1, T, rot_dim)
-
-        # Split Q into rotatable and pass-through parts
-        Q_rot, Q_pass = Q[..., :rot_dim], Q[..., rot_dim:]
-
-        # Apply RoPE ONLY where valid
-        Q_rot = self.rope(phases, Q_rot)
-
-        # Recombine
-        QR = torch.cat([Q_rot, Q_pass], dim=-1)
+        # Build RoPE phases for the full N dimension
+        # freqs is [1, 1, 1, N], need [1, 1, T, N] for broadcasting
+        r_phases = (
+            torch.arange(
+                0,
+                T,
+                device=self.freqs.device,
+                dtype=self.freqs.dtype,
+            ).view(1, 1, -1, 1)
+        ) * self.freqs  # [1, 1, T, 1] * [1, 1, 1, N] -> [1, 1, T, N]
+        
+        # Apply RoPE to full Q tensor
+        QR = self.rope(r_phases, Q)
         KR = QR  # BDH ties Q = K
 
+        # Current attention (causal mask via tril)
+        # scores: [B, nh, T, T], V: [B, nh, T, D]
+        # scores @ V: [B, nh, T, T] @ [B, nh, T, D] -> [B, nh, T, D]
         scores = (QR @ KR.mT).tril(diagonal=-1)
         return scores @ V
 
@@ -131,7 +133,9 @@ class BDH(nn.Module):
         x = self.ln(x)  # B, 1, T, D
 
         for level in range(C.n_layer):
-            x_latent = x @ self.encoder
+            # x: [B, 1, T, D], encoder: [nh, D, N]
+            # Need: [B, nh, T, N]
+            x_latent = torch.einsum('b1td,hde->bhte', x, self.encoder)
 
             x_sparse = F.relu(x_latent)  # B, nh, T, N
 
@@ -140,9 +144,14 @@ class BDH(nn.Module):
                 K=x_sparse,
                 V=x,
             )
+            # yKV: [B, nh, T, D], need to reduce to [B, 1, T, D] for residual connection
+            # Average over head dimension
+            yKV = yKV.mean(dim=1, keepdim=True)  # [B, 1, T, D]
             yKV = self.ln(yKV)
 
-            y_latent = yKV @ self.encoder_v
+            # yKV: [B, 1, T, D], encoder_v: [nh, D, N]
+            # Need: [B, nh, T, N] for next step
+            y_latent = torch.einsum('b1td,hde->bhte', yKV, self.encoder_v)
             y_sparse = F.relu(y_latent)
             xy_sparse = x_sparse * y_sparse  # B, nh, T, N
 
