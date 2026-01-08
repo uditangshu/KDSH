@@ -8,7 +8,7 @@ import sys
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install_from_requirements("requirements.txt")
-    .add_local_dir(".", "/root/bdh")
+    .add_local_dir(".", "/root/bdh", ignore=["venv", ".venv", "env", "__pycache__", "output", ".git"])
 )
 
 app = modal.App("bdh-inference")

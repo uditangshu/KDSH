@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-BDH Inference Script
+BDH Inference Script (Counterfactual Comparison)
 Runs the BDH model in pure inference mode using two text files.
-Processes backstory.txt first, then novel.txt with persistent state.
+Compares representation WITH and WITHOUT backstory to measure influence.
 """
 
 import os
 import sys
 import torch
+import torch.nn.functional as F
 
 # Import the BDH model from the repo
 try:
@@ -26,7 +27,7 @@ BACKSTORY_PATH = os.path.join(FILES_DIR, "backstory.txt")
 NOVEL_PATH = os.path.join(FILES_DIR, "novel.txt")
 
 # Chunk size for memory-safe processing
-CHUNK_SIZE = 256
+CHUNK_SIZE = 512
 
 
 def tokenize_text(text: str) -> torch.Tensor:
@@ -79,10 +80,10 @@ def get_state_summary(model: torch.nn.Module) -> dict:
     return summary
 
 
-def feed_tokens_sequential(model: torch.nn.Module, tokens: torch.Tensor, state, chunk_size: int = CHUNK_SIZE):
+def process_tokens(model: torch.nn.Module, tokens: torch.Tensor, chunk_size: int = CHUNK_SIZE):
     """
-    Feed tokens sequentially to the model with persistent state.
-    Returns (total_tokens_processed, final_logits, updated_state).
+    Process tokens through the model in chunks.
+    Returns the final logits from the last chunk.
     """
     model.eval()
     total_tokens = len(tokens)
@@ -93,20 +94,47 @@ def feed_tokens_sequential(model: torch.nn.Module, tokens: torch.Tensor, state, 
             end_idx = min(start_idx + chunk_size, total_tokens)
             chunk = tokens[start_idx:end_idx].unsqueeze(0).to(DEVICE)  # Shape: [1, chunk_size]
             
-            # Forward pass with state
-            logits, state = model(chunk, state=state)
-            last_logits = logits.cpu()
+            # Forward pass (no state parameter)
+            logits, _ = model(chunk)
+            last_logits = logits
             
             # Progress indicator
             if (start_idx // chunk_size) % 100 == 0:
                 print(f"    Processed {end_idx:,} / {total_tokens:,} tokens...")
     
-    return total_tokens, last_logits, state
+    return total_tokens, last_logits
+
+
+def extract_representation(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Extract final representation from logits.
+    Uses the last token's logits as the representation vector.
+    """
+    # Shape of logits: [batch, seq_len, vocab_size]
+    # Take the last token's full logits as representation
+    return logits[0, -1, :]  # Shape: [vocab_size]
+
+
+def compute_similarity(rep_a: torch.Tensor, rep_b: torch.Tensor) -> dict:
+    """
+    Compute similarity metrics between two representations.
+    """
+    # Normalize for cosine similarity
+    rep_a_norm = F.normalize(rep_a.float(), dim=0)
+    rep_b_norm = F.normalize(rep_b.float(), dim=0)
+    
+    cosine_sim = torch.dot(rep_a_norm, rep_b_norm).item()
+    l2_distance = torch.norm(rep_a.float() - rep_b.float()).item()
+    
+    return {
+        "cosine_similarity": cosine_sim,
+        "l2_distance": l2_distance,
+    }
 
 
 def main():
     print("=" * 60)
-    print("BDH Inference Script")
+    print("BDH Inference Script (Counterfactual Comparison)")
     print("=" * 60)
     
     # Check for required files
@@ -146,81 +174,74 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Total parameters: {total_params:,}")
     
-    # Print available objects from bdh module
-    print("\n  Available objects in bdh module:")
-    for obj in dir(bdh):
-        if not obj.startswith("_"):
-            print(f"    - {obj}")
-    
-    total_tokens_processed = 0
-    
-    # Initialize state to None before processing backstory
-    state = None
-    
-    # Read and process backstory.txt
-    print("\n[3] Processing backstory.txt...")
+    # Read text files
+    print("\n[3] Reading text files...")
     backstory_text = read_file_safe(BACKSTORY_PATH)
-    print(f"  Text length: {len(backstory_text):,} characters")
-    
-    backstory_tokens = tokenize_text(backstory_text)
-    print(f"  Token count: {len(backstory_tokens):,}")
-    
-    backstory_count, backstory_logits, state = feed_tokens_sequential(model, backstory_tokens, state)
-    total_tokens_processed += backstory_count
-    print(f"  ✓ Processed {backstory_count:,} tokens")
-    
-    # Process novel.txt WITHOUT resetting state
-    # The same state continues from backstory
-    print("\n[4] Processing novel.txt (WITHOUT resetting state)...")
     novel_text = read_file_safe(NOVEL_PATH)
-    print(f"  Text length: {len(novel_text):,} characters")
+    print(f"  Backstory: {len(backstory_text):,} characters")
+    print(f"  Novel: {len(novel_text):,} characters")
     
+    # ========================================
+    # PASS A: WITH BACKSTORY (backstory + novel)
+    # ========================================
+    print("\n[4] PASS A: Processing WITH backstory...")
+    combined_text = backstory_text + "\n\n" + novel_text
+    combined_tokens = tokenize_text(combined_text)
+    print(f"  Combined token count: {len(combined_tokens):,}")
+    
+    pass_a_count, pass_a_logits = process_tokens(model, combined_tokens)
+    pass_a_rep = extract_representation(pass_a_logits)
+    print(f"  ✓ Processed {pass_a_count:,} tokens")
+    print(f"  ✓ Representation shape: {pass_a_rep.shape}")
+    
+    # ========================================
+    # PASS B: WITHOUT BACKSTORY (novel only)
+    # ========================================
+    print("\n[5] PASS B: Processing WITHOUT backstory...")
     novel_tokens = tokenize_text(novel_text)
-    print(f"  Token count: {len(novel_tokens):,}")
+    print(f"  Novel token count: {len(novel_tokens):,}")
     
-    novel_count, novel_logits, state = feed_tokens_sequential(model, novel_tokens, state)
-    total_tokens_processed += novel_count
-    print(f"  ✓ Processed {novel_count:,} tokens")
+    pass_b_count, pass_b_logits = process_tokens(model, novel_tokens)
+    pass_b_rep = extract_representation(pass_b_logits)
+    print(f"  ✓ Processed {pass_b_count:,} tokens")
+    print(f"  ✓ Representation shape: {pass_b_rep.shape}")
     
-    # Print final state summary
+    # ========================================
+    # COMPARISON
+    # ========================================
+    print("\n[6] Comparing representations...")
+    similarity = compute_similarity(pass_a_rep, pass_b_rep)
+    
     print("\n" + "=" * 60)
-    print("FINAL STATE SUMMARY")
+    print("COUNTERFACTUAL COMPARISON RESULTS")
     print("=" * 60)
     
-    state_summary = get_state_summary(model)
+    print("\n[Representation Comparison]")
+    print(f"  Cosine Similarity: {similarity['cosine_similarity']:.6f}")
+    print(f"  L2 Distance: {similarity['l2_distance']:.6f}")
     
-    print("\n[Model Configuration]")
-    for key, value in state_summary["config"].items():
-        print(f"  {key}: {value}")
-    
-    print("\n[Parameter Statistics]")
-    for name, stats in state_summary["parameters"].items():
-        print(f"  {name}:")
-        print(f"    shape: {stats['shape']}")
-        print(f"    mean: {stats['mean']:.6f}, std: {stats['std']:.6f}")
-        print(f"    range: [{stats['min']:.6f}, {stats['max']:.6f}]")
+    # Interpret results
+    print("\n[Interpretation]")
+    if similarity['cosine_similarity'] > 0.99:
+        print("  → Backstory has MINIMAL influence on novel representation.")
+        print("    The final embedding is nearly identical with/without backstory.")
+    elif similarity['cosine_similarity'] > 0.95:
+        print("  → Backstory has SLIGHT influence on novel representation.")
+        print("    Small differences detected in the final embedding.")
+    elif similarity['cosine_similarity'] > 0.80:
+        print("  → Backstory has MODERATE influence on novel representation.")
+        print("    The backstory context noticeably affects the encoding.")
+    else:
+        print("  → Backstory has SIGNIFICANT influence on novel representation.")
+        print("    The final embedding is substantially different with backstory.")
     
     print("\n[Processing Summary]")
-    print(f"  Backstory tokens: {backstory_count:,}")
-    print(f"  Novel tokens: {novel_count:,}")
-    print(f"  Total tokens processed: {total_tokens_processed:,}")
+    print(f"  Pass A (with backstory): {pass_a_count:,} tokens")
+    print(f"  Pass B (novel only): {pass_b_count:,} tokens")
     
-    print("\n[Final State]")
-    if state is not None:
-        print(f"  State type: {type(state)}")
-        if isinstance(state, torch.Tensor):
-            print(f"  State shape: {state.shape}")
-            print(f"  State sample (first 5 values): {state.flatten()[:5].tolist()}")
-    else:
-        print("  State: None")
-    
-    print("\n[Last Logits Sample (first 5 values)]")
-    if novel_logits is not None:
-        print(f"  {novel_logits[0, -1, :5].tolist()}")
-    
-    print("\n" + "=" * 60)
-    print("Inference complete. Exiting cleanly.")
-    print("=" * 60)
+    print("\n[Sample Logits (last token, first 5 values)]")
+    print(f"  Pass A: {pass_a_rep[:5].tolist()}")
+    print(f"  Pass B: {pass_b_rep[:5].tolist()}")
     
     # Save outputs
     output_dir = os.path.join(os.path.dirname(__file__), "output")
@@ -231,19 +252,28 @@ def main():
     torch.save(model.state_dict(), model_path)
     print(f"\n[Saved] Model state dict: {model_path}")
     
-    # Save final state (if it exists)
-    if state is not None:
-        state_path = os.path.join(output_dir, "state.pt")
-        torch.save(state, state_path)
-        print(f"[Saved] Final state: {state_path}")
+    # Save representations
+    rep_path = os.path.join(output_dir, "representations.pt")
+    torch.save({
+        "pass_a_rep": pass_a_rep.cpu(),
+        "pass_b_rep": pass_b_rep.cpu(),
+        "similarity": similarity,
+    }, rep_path)
+    print(f"[Saved] Representations: {rep_path}")
     
-    # Save final logits
-    if novel_logits is not None:
-        logits_path = os.path.join(output_dir, "novel_logits.pt")
-        torch.save(novel_logits, logits_path)
-        print(f"[Saved] Novel logits: {logits_path}")
+    # Save logits
+    logits_path = os.path.join(output_dir, "logits.pt")
+    torch.save({
+        "pass_a_logits": pass_a_logits.cpu(),
+        "pass_b_logits": pass_b_logits.cpu(),
+    }, logits_path)
+    print(f"[Saved] Logits: {logits_path}")
     
     print(f"\nAll outputs saved to: {output_dir}")
+    
+    print("\n" + "=" * 60)
+    print("Inference complete. Exiting cleanly.")
+    print("=" * 60)
     
     return 0
 

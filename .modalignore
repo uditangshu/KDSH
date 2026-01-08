@@ -1,0 +1,21 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Project Specific
+output/
+files/test.csv
+files/train.csv
+
+# Git
+.git/
+
+# IDEs
+.vscode/
+.idea/
