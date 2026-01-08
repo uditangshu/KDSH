@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-BDH Advanced Multi-Level Inference System
+BDH Advanced Multi-Level Inference System - MEMORY SAFE DESIGN
 Implements 4 levels of reasoning:
 1. Local Semantic Alignment (baseline similarity)
 2. Temporal Semantic Alignment (when constraints apply)
 3. Constraint Consistency Checking (BDH state-based violation detection)
 4. Causal Plausibility Matching (detect implausible transitions)
+
+MEMORY OPTIMIZATIONS:
+- StateSnapshot stores only ~4 KB per chunk (mean pooled [D] + scalars)
+- Never stores full hidden states [B, 1, T, D] or attention patterns [T, T]
+- All summaries on CPU, only active computation on GPU
+- Story processed ONCE in Level2, all other levels reuse state_history
+- Explicit memory cleanup with torch.cuda.empty_cache()
+- Expected memory: 5-10 GB instead of 100 GB
 """
 
 import os
@@ -49,11 +57,22 @@ class TemporalEvent:
 
 @dataclass
 class StateSnapshot:
-    """Snapshot of BDH state at a given chunk - MEMORY OPTIMIZED."""
+    """Snapshot of BDH state at a given chunk - MEMORY SAFE DESIGN.
+    
+    Stores ONLY what BDH Track-B needs:
+    - Mean pooled embedding (not full state)
+    - Scalar diagnostics (not attention matrices)
+    - Constraint signals (not full activations)
+    
+    Memory per chunk: ~4 KB instead of ~8 MB
+    """
     chunk_idx: int
-    hidden_state_summary: torch.Tensor  # Only pooled/mean embedding, not full state [B, D]
+    state_mean: torch.Tensor  # [D] - mean pooled embedding on CPU
+    state_norm: float  # L2 norm of state
+    sparsity: float  # Activation sparsity
+    delta_norm: float  # Change from previous chunk
     constraint_signals: Dict[str, float]  # Constraint -> activation strength
-    # Removed: full hidden_state and attention_patterns to save memory
+    # Removed: full hidden_state, attention_patterns (quadratic), full activations
 
 
 class ConstraintExtractor:
@@ -142,92 +161,133 @@ class ConstraintExtractor:
 
 
 class BDHStateTracker:
-    """Track BDH state as story is processed chunk by chunk - MEMORY OPTIMIZED."""
+    """Track BDH state as story is processed chunk by chunk - MEMORY SAFE.
     
-    def __init__(self, model: BDH, config: BDHConfig, max_history: int = 100):
+    Processes story ONCE and stores lightweight summaries.
+    Memory complexity: O(T * D) instead of O(T² * D * L)
+    """
+    
+    def __init__(self, model: BDH, config: BDHConfig):
         self.model = model
         self.config = config
         self.state_history: List[StateSnapshot] = []
-        self.max_history = max_history  # Only keep last N states to limit memory
+        self.previous_summary: Optional[torch.Tensor] = None  # Track for delta_norm
+    
+    def reset(self):
+        """Clear state history - call before every new inference."""
+        self.state_history.clear()
+        self.previous_summary = None
+        torch.cuda.empty_cache()
         
     def initialize_with_backstory(self, backstory_tokens: torch.Tensor) -> StateSnapshot:
-        """Process backstory to initialize BDH state."""
+        """Process backstory to initialize BDH state - MEMORY SAFE."""
         self.model.eval()
         with torch.no_grad():
-            # Process backstory in chunks
-            state = None
+            # Process backstory in chunks - don't store full states
+            current_summary = None
             for i in range(0, len(backstory_tokens), CHUNK_SIZE):
                 chunk = backstory_tokens[i:i+CHUNK_SIZE].unsqueeze(0).to(DEVICE)  # [1, T]
-                _, hidden_state, _ = self._forward_pass_with_state(chunk, state, return_attention=False)
                 
-                # Extract summary immediately and move to CPU to save GPU memory
-                state_summary = hidden_state.mean(dim=(1, 2)).cpu()  # [B, D] on CPU
-                del hidden_state  # Free GPU memory immediately
-                torch.cuda.empty_cache()
+                # Forward pass - get hidden state
+                _, hidden_state, _ = self._forward_pass_with_state(chunk, None, return_attention=False)
                 
-                # Only keep summary, not full state
-                state = state_summary
+                # Extract summary IMMEDIATELY - mean pool over sequence
+                state_mean = hidden_state.mean(dim=(1, 2)).squeeze(0).cpu()  # [D] on CPU
+                state_norm = state_mean.norm().item()
+                
+                # Compute sparsity (while state is on GPU)
+                sparsity = (hidden_state.abs() > 0.1).float().mean().item()
+                
+                # Delta norm (change from previous)
+                delta_norm = 0.0
+                if current_summary is not None:
+                    delta_norm = (state_mean - current_summary).norm().item()
+                
+                # Extract constraint signals while state is on GPU
+                constraint_signals = self._extract_constraint_signals(hidden_state)
+                
+                # Free GPU memory IMMEDIATELY
+                del hidden_state
+                if i % 50 == 0:
+                    torch.cuda.empty_cache()
+                
+                current_summary = state_mean
             
-            # Extract constraint signals from summary
-            constraint_signals = self._extract_constraint_signals_from_summary(state.to(DEVICE))
-            
-            # Create initial snapshot with CPU-based summary
+            # Create initial snapshot - lightweight
             snapshot = StateSnapshot(
                 chunk_idx=-1,  # Backstory chunk
-                hidden_state_summary=state.cpu(),  # Keep on CPU
+                state_mean=current_summary,
+                state_norm=state_norm,
+                sparsity=sparsity,
+                delta_norm=0.0,
                 constraint_signals=constraint_signals
             )
+            
+            self.previous_summary = current_summary
             return snapshot
     
-    def process_story_chunk(self, chunk_tokens: torch.Tensor, chunk_idx: int, 
-                           previous_state: Optional[torch.Tensor] = None) -> Tuple[StateSnapshot, torch.Tensor]:
-        """Process a story chunk and return state snapshot - MEMORY OPTIMIZED."""
+    def process_story_chunk(self, chunk_tokens: torch.Tensor, chunk_idx: int) -> StateSnapshot:
+        """Process a story chunk and return lightweight snapshot - MEMORY SAFE.
+        
+        Never stores full hidden states or attention patterns.
+        Only stores scalar diagnostics and mean-pooled embedding.
+        """
         self.model.eval()
         with torch.no_grad():
             # Ensure chunk has batch dimension [1, T]
             if chunk_tokens.dim() == 1:
                 chunk_tokens = chunk_tokens.unsqueeze(0)
             
-            # Convert previous_state to GPU temporarily if needed (it's a summary on CPU)
-            prev_state_gpu = previous_state.to(DEVICE) if previous_state is not None and previous_state.device.type == 'cpu' else previous_state
-            
+            # Forward pass - get hidden state (no previous state needed, BDH processes chunk independently)
             logits, hidden_state, _ = self._forward_pass_with_state(
-                chunk_tokens.to(DEVICE), prev_state_gpu, return_attention=False  # Don't store attention
+                chunk_tokens.to(DEVICE), None, return_attention=False  # Never store attention
             )
             
-            # Clear temporary GPU state
-            if prev_state_gpu is not None and prev_state_gpu.device.type == 'cuda':
-                del prev_state_gpu
+            # Extract summary IMMEDIATELY - mean pool over sequence
+            state_mean = hidden_state.mean(dim=(1, 2)).squeeze(0).cpu()  # [D] on CPU
+            state_norm = state_mean.norm().item()
             
-            # Extract summary immediately and move to CPU
-            hidden_state_summary = hidden_state.mean(dim=(1, 2)).cpu()  # [B, D] on CPU
+            # Compute sparsity (while state is on GPU)
+            sparsity = (hidden_state.abs() > 0.1).float().mean().item()
             
-            # Extract constraint signals while state is on GPU, then move summary to CPU
+            # Delta norm (change from previous chunk) - pre-compute for Level4
+            delta_norm = 0.0
+            if self.previous_summary is not None:
+                delta_norm = (state_mean - self.previous_summary).norm().item()
+            
+            # Extract constraint signals while state is on GPU
             constraint_signals = self._extract_constraint_signals(hidden_state)
             
-            # Delete full hidden state to free GPU memory
+            # DELETE full hidden state IMMEDIATELY to free GPU memory
             del hidden_state
-            torch.cuda.empty_cache()
+            if chunk_idx % 100 == 0:
+                torch.cuda.empty_cache()
             
+            # Create lightweight snapshot
             snapshot = StateSnapshot(
                 chunk_idx=chunk_idx,
-                hidden_state_summary=hidden_state_summary,  # Only summary on CPU
+                state_mean=state_mean,  # [D] on CPU
+                state_norm=state_norm,
+                sparsity=sparsity,
+                delta_norm=delta_norm,
                 constraint_signals=constraint_signals
             )
             
-            # Only keep last max_history states to limit memory
+            # Store snapshot (only ~4 KB each)
             self.state_history.append(snapshot)
-            if len(self.state_history) > self.max_history:
-                # Remove oldest state
-                self.state_history = self.state_history[-self.max_history:]
             
-            # Return summary for next chunk (will be used as initialization hint)
-            return snapshot, hidden_state_summary
+            # Update previous summary for next chunk
+            self.previous_summary = state_mean
+            
+            return snapshot
     
     def _forward_pass_with_state(self, tokens: torch.Tensor, 
                                 previous_state: Optional[torch.Tensor] = None,
                                 return_attention: bool = False):
-        """Forward pass that can carry state from previous chunks."""
+        """Forward pass - MEMORY SAFE: never stores attention patterns.
+        
+        NOTE: return_attention is ignored - we never store attention (quadratic memory).
+        """
         C = self.config
         B, T = tokens.size()
         D = C.n_embd
@@ -238,26 +298,17 @@ class BDHStateTracker:
         x = self.model.embed(tokens).unsqueeze(1)  # [B, 1, T, D]
         x = self.model.ln(x)
         
-        # If previous state exists, incorporate it (simplified - can be enhanced)
-        # Note: previous_state is now a summary [B, D] on CPU, not full state
-        if previous_state is not None:
-            # Could blend previous summary with current embedding if needed
-            # For now, we don't use it to avoid memory issues
-            pass
-        
-        # Process through layers
-        attention_patterns = []
+        # Process through layers - BDH processes chunk independently
+        # (Previous state integration would require full state, which we avoid)
         for level in range(C.n_layer):
             # Encoder projection
             x_squeezed = x.squeeze(1)
             x_latent = torch.einsum('btd,hde->bhte', x_squeezed, self.model.encoder)
             x_sparse = F.relu(x_latent)
             
-            # Attention
+            # Attention (we compute it but NEVER store the scores matrix)
             yKV = self.model.attn(Q=x_sparse, K=x_sparse, V=x)
-            if return_attention and level == 0:
-                # Store attention for analysis
-                attention_patterns.append(yKV.mean(dim=1).detach())
+            # Do NOT store attention patterns - quadratic in T!
             
             yKV = yKV.mean(dim=1, keepdim=True)
             yKV = self.model.ln(yKV)
@@ -278,10 +329,8 @@ class BDHStateTracker:
         logits = x.view(B, T, D) @ self.model.lm_head
         hidden_state = x.detach()  # Final hidden state
         
-        if return_attention and attention_patterns:
-            attention_tensor = torch.cat(attention_patterns, dim=0)
-        else:
-            attention_tensor = torch.zeros(1, 1, 1).to(hidden_state.device)  # Placeholder
+        # Never return attention patterns - memory killer
+        attention_tensor = None
         
         return logits, hidden_state, attention_tensor
     
@@ -307,70 +356,52 @@ class BDHStateTracker:
 
 
 class Level1LocalSemanticAlignment:
-    """LEVEL 1: Local Semantic Alignment - basic similarity matching."""
+    """LEVEL 1: Local Semantic Alignment - REUSE state_history, don't re-encode."""
     
-    def __init__(self, model: BDH):
-        self.model = model
+    def __init__(self, state_tracker: BDHStateTracker):
+        self.state_tracker = state_tracker
     
-    def compute(self, backstory_tokens: torch.Tensor, story_tokens: torch.Tensor) -> Dict:
-        """Compute local semantic alignment scores."""
-        self.model.eval()
+    def compute(self, backstory_summary: torch.Tensor) -> Dict:
+        """Compute local semantic alignment using existing state history.
         
-        with torch.no_grad():
-            # Encode backstory
-            _, backstory_state = self._encode(backstory_tokens)
-            backstory_embedding = backstory_state.mean(dim=(1, 2))  # [B, D]
-            
-            # Encode story chunks - MEMORY OPTIMIZED
-            story_chunks = self._chunk_tokens(story_tokens, CHUNK_SIZE)
-            chunk_similarities = []
-            
-            for i, chunk in enumerate(story_chunks):
-                _, chunk_state = self._encode(chunk)  # _encode handles batch dimension
-                chunk_embedding = chunk_state.mean(dim=(1, 2))  # [B, D]
-                
-                # Cosine similarity
-                similarity = F.cosine_similarity(
-                    backstory_embedding, chunk_embedding, dim=1
-                ).item()
-                chunk_similarities.append(similarity)
-                
-                # Clear intermediate tensors periodically
-                del chunk_state
-                if i % 50 == 0:
-                    torch.cuda.empty_cache()
-            
-            # Compute metrics
-            mean_similarity = np.mean(chunk_similarities)
-            max_similarity = np.max(chunk_similarities)
-            min_similarity = np.min(chunk_similarities)
-            
+        MEMORY SAFE: Reuses state_history from Level2, doesn't re-encode story.
+        """
+        if not self.state_tracker.state_history:
+            # Fallback: return default if no history (shouldn't happen)
             return {
-                'mean_similarity': mean_similarity,
-                'max_similarity': max_similarity,
-                'min_similarity': min_similarity,
-                'chunk_similarities': chunk_similarities,
-                'alignment_score': mean_similarity,  # Higher is better
+                'mean_similarity': 0.5,
+                'max_similarity': 0.5,
+                'min_similarity': 0.5,
+                'chunk_similarities': [],
+                'alignment_score': 0.5,
             }
-    
-    def _encode(self, tokens: torch.Tensor):
-        """Encode tokens to get representation."""
-        # Add batch dimension if needed: [T] -> [1, T]
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
         
-        # Simplified encoding - just forward pass
-        logits, _ = self.model(tokens.to(DEVICE))
-        # Get hidden state from model (would need to modify model.forward to return it)
-        # For now, use logits as proxy
-        return logits, logits
-    
-    def _chunk_tokens(self, tokens: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
-        """Split tokens into chunks."""
-        chunks = []
-        for i in range(0, len(tokens), chunk_size):
-            chunks.append(tokens[i:i+chunk_size])
-        return chunks
+        chunk_similarities = []
+        backstory_mean = backstory_summary.cpu()  # Ensure CPU
+        
+        # Reuse state_history - don't re-encode!
+        for snapshot in self.state_tracker.state_history:
+            # Compare backstory summary with chunk summary
+            chunk_mean = snapshot.state_mean  # Already on CPU
+            
+            # Cosine similarity between summaries
+            similarity = F.cosine_similarity(
+                backstory_mean.unsqueeze(0), chunk_mean.unsqueeze(0), dim=1
+            ).item()
+            chunk_similarities.append(similarity)
+        
+        # Compute metrics
+        mean_similarity = np.mean(chunk_similarities) if chunk_similarities else 0.5
+        max_similarity = np.max(chunk_similarities) if chunk_similarities else 0.5
+        min_similarity = np.min(chunk_similarities) if chunk_similarities else 0.5
+        
+        return {
+            'mean_similarity': mean_similarity,
+            'max_similarity': max_similarity,
+            'min_similarity': min_similarity,
+            'chunk_similarities': chunk_similarities,
+            'alignment_score': mean_similarity,  # Higher is better
+        }
 
 
 class Level2TemporalSemanticAlignment:
@@ -394,17 +425,16 @@ class Level2TemporalSemanticAlignment:
         # Initialize with backstory state
         backstory_tokens = self._tokenize(backstory_text)
         initial_state = self.tracker.initialize_with_backstory(backstory_tokens)
-        current_state = initial_state.hidden_state_summary  # Use summary, not full state
+        backstory_summary = initial_state.state_mean  # Store for Level1
         torch.cuda.empty_cache()  # Clear after initialization
         
         # Track when constraints appear vs when they're violated
         constraint_first_occurrence: Dict[str, int] = {}
         constraint_violations: Dict[str, List[int]] = defaultdict(list)
         
+        # Process story ONCE - build state_history
         for chunk_idx, chunk in enumerate(story_chunks):
-            snapshot, current_state = self.tracker.process_story_chunk(
-                chunk, chunk_idx, current_state.to(DEVICE) if current_state.device.type == 'cpu' else current_state
-            )
+            snapshot = self.tracker.process_story_chunk(chunk, chunk_idx)
             
             # Check each constraint
             for constraint in constraints:
@@ -422,6 +452,9 @@ class Level2TemporalSemanticAlignment:
             # Clear CUDA cache periodically
             if chunk_idx % 100 == 0:
                 torch.cuda.empty_cache()
+        
+        # Return backstory_summary for Level1 reuse
+        self._backstory_summary = backstory_summary
         
         # Compute temporal consistency scores
         temporal_scores = {}
@@ -527,10 +560,9 @@ class Level3ConstraintConsistencyChecking:
         }
     
     def _get_constraint_strength(self, snapshot: StateSnapshot, constraint: Constraint) -> float:
-        """Get strength of constraint signal in state snapshot - MEMORY OPTIMIZED."""
+        """Get strength of constraint signal - MEMORY SAFE: uses summary only."""
         # Use summary embedding to compute constraint strength
-        # Simplified: use variance as proxy for constraint activation
-        summary = snapshot.hidden_state_summary  # Already on CPU
+        summary = snapshot.state_mean  # [D] on CPU
         state_variance = summary.var().item()
         
         # Map to constraint strength (0-1)
@@ -569,16 +601,26 @@ class Level4CausalPlausibilityMatching:
         state_transitions = []
         implausible_jumps = []
         
-        # Compute state transitions between chunks
+        # Compute state transitions between chunks - MEMORY SAFE
         for i in range(1, len(self.tracker.state_history)):
             prev_snapshot = self.tracker.state_history[i-1]
             curr_snapshot = self.tracker.state_history[i]
             
-            # Compute state difference using summaries
-            state_diff = self._compute_state_difference(
-                prev_snapshot.hidden_state_summary,
-                curr_snapshot.hidden_state_summary
-            )
+            # Use pre-computed delta_norm (already computed efficiently)
+            magnitude = curr_snapshot.delta_norm / max(prev_snapshot.state_norm, 1e-8)
+            magnitude = min(magnitude, 1.0)
+            
+            # Compute direction (cosine similarity)
+            direction = F.cosine_similarity(
+                prev_snapshot.state_mean.unsqueeze(0),
+                curr_snapshot.state_mean.unsqueeze(0),
+                dim=1
+            ).item()
+            
+            state_diff = {
+                'magnitude': magnitude,
+                'direction': direction,
+            }
             
             state_transitions.append({
                 'from_chunk': prev_snapshot.chunk_idx,
@@ -614,21 +656,24 @@ class Level4CausalPlausibilityMatching:
             'implausible_count': implausible_count,
         }
     
-    def _compute_state_difference(self, state1: torch.Tensor, state2: torch.Tensor) -> Dict:
-        """Compute difference between two states - MEMORY OPTIMIZED."""
-        # States are already summaries [B, D], no need to flatten
-        # Ensure they're on same device and compute difference
-        if state1.device != state2.device:
-            state1 = state1.to(state2.device)
+    def _compute_state_difference(self, snapshot1: StateSnapshot, snapshot2: StateSnapshot) -> Dict:
+        """Compute difference between two states - MEMORY SAFE: uses summaries only.
         
-        # Compute magnitude of change (already flattened summaries)
-        magnitude = F.pairwise_distance(state1.unsqueeze(0), state2.unsqueeze(0)).item()
+        Never flattens full tensors - only compares [D] summaries.
+        """
+        # States are already summaries [D] on CPU
+        state1 = snapshot1.state_mean  # [D]
+        state2 = snapshot2.state_mean  # [D]
         
-        # Normalize
-        magnitude = min(magnitude / state1.norm().item(), 1.0) if state1.norm() > 0 else 0.0
+        # Compute magnitude of change (between summaries)
+        magnitude = (state1 - state2).norm().item()
         
-        # Compute direction (cosine similarity)
-        direction = F.cosine_similarity(state1.unsqueeze(0), state2.unsqueeze(0)).item()
+        # Normalize by first state norm
+        norm1 = state1.norm().item()
+        magnitude = min(magnitude / norm1, 1.0) if norm1 > 0 else 0.0
+        
+        # Compute direction (cosine similarity between summaries)
+        direction = F.cosine_similarity(state1.unsqueeze(0), state2.unsqueeze(0), dim=1).item()
         
         return {
             'magnitude': magnitude,
@@ -637,15 +682,16 @@ class Level4CausalPlausibilityMatching:
     
     def _check_narrative_support(self, prev_snapshot: StateSnapshot, 
                                 curr_snapshot: StateSnapshot) -> bool:
-        """Check if state transition has narrative support - MEMORY OPTIMIZED."""
-        # Simplified: use summary embeddings to check transition smoothness
-        # In practice, would look for intermediate events, trauma, training, etc.
+        """Check if state transition has narrative support - MEMORY SAFE.
         
-        # Check if summary embedding changed gradually (small steps) vs suddenly (large jump)
-        summary_diff = (curr_snapshot.hidden_state_summary - prev_snapshot.hidden_state_summary).abs().mean().item()
+        Uses pre-computed delta_norm instead of recomputing.
+        """
+        # Use delta_norm (already computed efficiently during chunk processing)
+        # Gradual transitions have small delta_norm, sudden jumps have large delta_norm
+        delta_norm_normalized = curr_snapshot.delta_norm / max(prev_snapshot.state_norm, 1e-8)
         
-        # If summary changed gradually, assume narrative support
-        return summary_diff < 0.5
+        # If transition is gradual (small delta), assume narrative support
+        return delta_norm_normalized < 0.5
 
 
 class AdvancedBDHInference:
@@ -657,40 +703,47 @@ class AdvancedBDHInference:
         
         # Initialize components
         self.constraint_extractor = ConstraintExtractor()
-        # Limit state history to 100 chunks (last 100) to save memory
-        self.state_tracker = BDHStateTracker(model, config, max_history=100)
-        self.level1 = Level1LocalSemanticAlignment(model)
+        self.state_tracker = BDHStateTracker(model, config)
+        # Level1 now reuses state_history from Level2 (doesn't re-encode)
+        self.level1 = Level1LocalSemanticAlignment(self.state_tracker)
         self.level2 = Level2TemporalSemanticAlignment(self.constraint_extractor, self.state_tracker)
         self.level3 = Level3ConstraintConsistencyChecking(self.state_tracker)
         self.level4 = Level4CausalPlausibilityMatching(self.state_tracker)
     
     def predict(self, backstory_text: str, story_text: str) -> Dict:
-        """Run complete 4-level inference pipeline."""
+        """Run complete 4-level inference pipeline - MEMORY SAFE.
+        
+        Key optimization: Process story ONCE in Level2, reuse state_history for all levels.
+        """
+        # Reset state tracker before new inference
+        self.state_tracker.reset()
+        
         # Tokenize
-        backstory_tokens = self._tokenize(backstory_text)
         story_tokens = self._tokenize(story_text)
         
         # Extract constraints
         constraints = self.constraint_extractor.extract(backstory_text)
         
-        # LEVEL 1: Local Semantic Alignment
-        level1_results = self.level1.compute(backstory_tokens, story_tokens)
-        torch.cuda.empty_cache()  # Clear after Level 1
-        
-        # LEVEL 2: Temporal Semantic Alignment (also builds state history)
+        # LEVEL 2: Process story ONCE and build state_history
+        # This is the ONLY place we process the full story through BDH
         level2_results = self.level2.compute(backstory_text, story_tokens, constraints)
-        torch.cuda.empty_cache()  # Clear after Level 2
+        backstory_summary = self.level2._backstory_summary  # Get from Level2
+        torch.cuda.empty_cache()
         
-        # LEVEL 3: Constraint Consistency Checking (uses state history)
+        # LEVEL 1: Reuse state_history from Level2 (don't re-encode!)
+        level1_results = self.level1.compute(backstory_summary)
+        torch.cuda.empty_cache()
+        
+        # LEVEL 3: Constraint Consistency Checking (uses state_history)
         level3_results = self.level3.compute(constraints)
-        torch.cuda.empty_cache()  # Clear after Level 3
+        torch.cuda.empty_cache()
         
-        # LEVEL 4: Causal Plausibility Matching (uses state history)
+        # LEVEL 4: Causal Plausibility Matching (uses state_history)
         level4_results = self.level4.compute()
-        torch.cuda.empty_cache()  # Clear after Level 4
+        torch.cuda.empty_cache()
         
-        # Clear state history to free memory (already processed)
-        self.state_tracker.state_history.clear()
+        # Clear state history after processing (memory cleanup)
+        self.state_tracker.reset()
         
         # Combine scores for final prediction
         prediction, confidence, rationale = self._combine_results(
