@@ -135,7 +135,9 @@ class BDH(nn.Module):
         for level in range(C.n_layer):
             # x: [B, 1, T, D], encoder: [nh, D, N]
             # Need: [B, nh, T, N]
-            x_latent = torch.einsum('b1td,hde->bhte', x, self.encoder)
+            # Squeeze the size-1 dimension for einsum (can't use numbers in subscripts)
+            x_squeezed = x.squeeze(1)  # [B, T, D]
+            x_latent = torch.einsum('btd,hde->bhte', x_squeezed, self.encoder)
 
             x_sparse = F.relu(x_latent)  # B, nh, T, N
 
@@ -151,7 +153,9 @@ class BDH(nn.Module):
 
             # yKV: [B, 1, T, D], encoder_v: [nh, D, N]
             # Need: [B, nh, T, N] for next step
-            y_latent = torch.einsum('b1td,hde->bhte', yKV, self.encoder_v)
+            # Squeeze the size-1 dimension for einsum
+            yKV_squeezed = yKV.squeeze(1)  # [B, T, D]
+            y_latent = torch.einsum('btd,hde->bhte', yKV_squeezed, self.encoder_v)
             y_sparse = F.relu(y_latent)
             xy_sparse = x_sparse * y_sparse  # B, nh, T, N
 

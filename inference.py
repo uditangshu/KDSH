@@ -114,7 +114,9 @@ def run_bdh_forward_step_by_step(model: BDH, idx: torch.Tensor) -> dict:
         
         # Encoder projection
         # x: [B, 1, T, D], encoder: [nh, D, N] -> x_latent: [B, nh, T, N]
-        x_latent = torch.einsum('b1td,hde->bhte', x, model.encoder)
+        # Squeeze the size-1 dimension for einsum (can't use numbers in subscripts)
+        x_squeezed = x.squeeze(1)  # [B, T, D]
+        x_latent = torch.einsum('btd,hde->bhte', x_squeezed, model.encoder)
         layer_info["x_latent_shape"] = list(x_latent.shape)
         
         # ReLU activation (sparsity)
@@ -137,7 +139,9 @@ def run_bdh_forward_step_by_step(model: BDH, idx: torch.Tensor) -> dict:
         
         # Value encoder projection
         # yKV: [B, 1, T, D], encoder_v: [nh, D, N] -> y_latent: [B, nh, T, N]
-        y_latent = torch.einsum('b1td,hde->bhte', yKV, model.encoder_v)
+        # Squeeze the size-1 dimension for einsum
+        yKV_squeezed = yKV.squeeze(1)  # [B, T, D]
+        y_latent = torch.einsum('btd,hde->bhte', yKV_squeezed, model.encoder_v)
         y_sparse = F.relu(y_latent)
         layer_info["y_sparse_nonzero_ratio"] = (y_sparse > 0).float().mean().item()
         
