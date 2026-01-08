@@ -35,10 +35,16 @@ class Attention(torch.nn.Module):
         self.config = config
         nh = config.n_head
         D = config.n_embd
+        head_dim = config.n_embd // config.n_head
+        freqs = get_freqs(n=head_dim, theta=10000
+, dtype=torch.float32)
         N = config.mlp_internal_dim_multiplier * D // nh
+        """
         self.freqs = torch.nn.Buffer(
-            get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N)
-        )
+            get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N) )
+        """
+        self.register_buffer("freqs", freqs)
+
 
     @staticmethod
     def phases_cos_sin(phases):
