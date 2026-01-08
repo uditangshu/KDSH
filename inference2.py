@@ -156,7 +156,7 @@ class BDHStateTracker:
             # Process backstory in chunks
             state = None
             for i in range(0, len(backstory_tokens), CHUNK_SIZE):
-                chunk = backstory_tokens[i:i+CHUNK_SIZE].to(DEVICE)
+                chunk = backstory_tokens[i:i+CHUNK_SIZE].unsqueeze(0).to(DEVICE)  # [1, T]
                 _, hidden_state, _ = self._forward_pass_with_state(chunk, state, return_attention=False)
                 state = hidden_state  # Carry state forward
             
@@ -283,7 +283,7 @@ class Level1LocalSemanticAlignment:
             chunk_similarities = []
             
             for chunk in story_chunks:
-                _, chunk_state = self._encode(chunk.unsqueeze(0))
+                _, chunk_state = self._encode(chunk)  # _encode handles batch dimension
                 chunk_embedding = chunk_state.mean(dim=(1, 2))  # [B, D]
                 
                 # Cosine similarity
@@ -307,6 +307,10 @@ class Level1LocalSemanticAlignment:
     
     def _encode(self, tokens: torch.Tensor):
         """Encode tokens to get representation."""
+        # Add batch dimension if needed: [T] -> [1, T]
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        
         # Simplified encoding - just forward pass
         logits, _ = self.model(tokens.to(DEVICE))
         # Get hidden state from model (would need to modify model.forward to return it)
