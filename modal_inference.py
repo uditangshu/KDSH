@@ -30,6 +30,7 @@ def run_inference():
     
     # Verify required files exist
     required_files = [
+        "bdh.py",
         "inference.py",
         "files/backstory.txt",
         "files/novel.txt"
@@ -50,7 +51,7 @@ def run_inference():
     # streaming stdout/stderr to the container logs
     try:
         subprocess.run(
-            [sys.executable, "inference.py"],
+            [sys.executable, "-u", "inference.py"],
             check=True,
             stdout=sys.stdout,
             stderr=sys.stderr,
