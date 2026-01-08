@@ -4,9 +4,11 @@ import subprocess
 import sys
 
 # Define the image
+# Copies local dir "." to "/root/bdh" in the container
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install_from_requirements("requirements.txt")
+    .add_local_dir(".", "/root/bdh")
 )
 
 app = modal.App("bdh-inference")
@@ -17,13 +19,12 @@ app = modal.App("bdh-inference")
     cpu=4,
     memory=32768,
     timeout=14400,  # 4 hours
-    mounts=[modal.Mount.from_local_dir(".", remote_path="/root/bdh")]
 )
 def run_inference():
     """
     Runs the BDH inference script on the allocated GPU.
     """
-    # Change directory to the repo root inside the container
+    # Change directory to the copied repo root inside the container
     repo_root = "/root/bdh"
     os.chdir(repo_root)
     
@@ -61,5 +62,6 @@ def run_inference():
     
     print("Inference completed successfully.")
 
-if __name__ == "__main__":
-    app.serve()
+@app.local_entrypoint()
+def main():
+    run_inference.remote()

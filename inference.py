@@ -222,6 +222,29 @@ def main():
     print("Inference complete. Exiting cleanly.")
     print("=" * 60)
     
+    # Save outputs
+    output_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save model state dict
+    model_path = os.path.join(output_dir, "model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"\n[Saved] Model state dict: {model_path}")
+    
+    # Save final state (if it exists)
+    if state is not None:
+        state_path = os.path.join(output_dir, "state.pt")
+        torch.save(state, state_path)
+        print(f"[Saved] Final state: {state_path}")
+    
+    # Save final logits
+    if novel_logits is not None:
+        logits_path = os.path.join(output_dir, "novel_logits.pt")
+        torch.save(novel_logits, logits_path)
+        print(f"[Saved] Novel logits: {logits_path}")
+    
+    print(f"\nAll outputs saved to: {output_dir}")
+    
     return 0
 
 

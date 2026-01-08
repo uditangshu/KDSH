@@ -1,5 +1,6 @@
 # BDH specific
 input.txt
+output/
 venv/
 .venv/
 __pycache__/
