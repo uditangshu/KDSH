@@ -60,24 +60,27 @@ class Attention(torch.nn.Module):
         return (v * phases_cos).to(v.dtype) + (v_rot * phases_sin).to(v.dtype)
 
     def forward(self, Q, K, V):
-
         assert self.freqs.dtype == torch.float32
         assert K is Q
 
         B, nh, T, latent_dim = Q.shape
+        rot_dim = self.freqs.shape[0]   # ← the ONLY safe RoPE dimension
 
-        # Use freqs matching latent_dim
-        freqs = self.freqs[:latent_dim].to(Q.device)
+        # Build RoPE phases ONLY for rot_dim
+        freqs = self.freqs.to(Q.device)                 # [rot_dim]
+        positions = torch.arange(T, device=Q.device, dtype=freqs.dtype)
+        phases = positions[:, None] * freqs[None, :]    # [T, rot_dim]
+        phases = phases.view(1, 1, T, rot_dim)
 
-        positions = torch.arange(
-            T, device=Q.device, dtype=freqs.dtype
-        )
+        # Split Q into rotatable and pass-through parts
+        Q_rot, Q_pass = Q[..., :rot_dim], Q[..., rot_dim:]
 
-        phases = positions[:, None] * freqs[None, :]
-        phases = phases.view(1, 1, T, latent_dim)
+        # Apply RoPE ONLY where valid
+        Q_rot = self.rope(phases, Q_rot)
 
-        QR = self.rope(phases, Q)
-        KR = QR  # BDH uses tied Q = K
+        # Recombine
+        QR = torch.cat([Q_rot, Q_pass], dim=-1)
+        KR = QR  # BDH ties Q = K
 
         scores = (QR @ KR.mT).tril(diagonal=-1)
         return scores @ V
