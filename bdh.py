@@ -64,26 +64,25 @@ class Attention(torch.nn.Module):
         Qh = Q.view(B, nh, T, head_dim)
         Kh = Qh  # K == Q in BDH
 
-        # 2️⃣ Build RoPE phases
-        freqs = self.freqs.to(Q.device)          # [head_dim]
+        # 2️⃣ Build RoPE phases (MATCH head_dim exactly)
+        freqs = self.freqs.to(Q.device)           # [head_dim]
         positions = torch.arange(
             T, device=Q.device, dtype=freqs.dtype
-        )                                        # [T]
+        )                                         # [T]
 
-        r_phases = positions[:, None] * freqs[None, :]  # [T, head_dim]
-        r_phases = r_phases.view(1, 1, T, head_dim)
+        phases = positions[:, None] * freqs[None, :]   # [T, head_dim]
+        phases = phases.view(1, 1, T, head_dim)
 
-        # 3️⃣ Apply RoPE per head
-        Qh = self.rope(r_phases, Qh)
-        Kh = self.rope(r_phases, Kh)
+        # 3️⃣ Apply RoPE (your implementation)
+        Qh = self.rope(phases, Qh)
+        Kh = self.rope(phases, Kh)
 
         # 4️⃣ Merge heads back
         QR = Qh.view(B, nh, T, D)
         KR = Kh.view(B, nh, T, D)
 
-        # 5️⃣ Attention (causal)
+        # 5️⃣ Attention
         scores = (QR @ KR.mT).tril(diagonal=-1)
-
         return scores @ V
 
 class BDH(nn.Module):
