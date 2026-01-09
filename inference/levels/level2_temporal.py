@@ -1,91 +1,144 @@
-"""Level 2: Temporal Semantic Alignment."""
+"""Level 2: Temporal Window Validation - IMPROVED.
+
+Uses Level 1's relevant chunks to validate temporal consistency.
+Checks: Does the constraint appear at valid times? Before/after expected?
+"""
 import torch
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from collections import defaultdict
-from ..models import Constraint, TemporalEvent
-from ..tokenizer import tokenize_text, chunk_tokens
-
-CHUNK_SIZE = 512
+from ..models import Constraint, StateSnapshot
 
 
-class Level2TemporalSemanticAlignment:
-    """Temporal Semantic Alignment - WHEN constraints apply."""
+class Level2TemporalValidation:
+    """Level 2: Validate temporal consistency of constraints.
     
-    def __init__(self, constraint_extractor, state_tracker):
-        self.extractor = constraint_extractor
-        self.tracker = state_tracker
-        self._backstory_summary = None
+    Uses Level 1's relevant_chunks to:
+    1. Find when each constraint first appears
+    2. Check if constraint usage is temporally consistent
+    3. Identify temporal violations (used by Level 3)
+    """
     
-    def compute(self, backstory_text: str, story_tokens: torch.Tensor, 
-               constraints: List[Constraint]) -> Dict:
-        """Compute temporal alignment scores."""
-        if not constraints:
-            constraints = self.extractor.extract(backstory_text)
+    def __init__(self, state_tracker):
+        self.state_tracker = state_tracker
+    
+    def compute(self, constraints: List[Constraint], 
+                level1_results: Dict) -> Dict:
+        """Validate temporal consistency using Level 1's relevant chunks.
         
-        story_chunks = chunk_tokens(story_tokens, CHUNK_SIZE)
-        temporal_events: List[TemporalEvent] = []
+        Args:
+            constraints: List of extracted constraints
+            level1_results: Output from Level 1 containing relevant_chunks
         
-        backstory_tokens = tokenize_text(backstory_text)
-        initial_state = self.tracker.initialize_with_backstory(backstory_tokens)
-        self._backstory_summary = initial_state.state_mean
-        torch.cuda.empty_cache()
+        Returns:
+            valid_windows: Dict[constraint_text -> (start_idx, end_idx)]
+            temporal_violations: List of violations to pass to Level 3
+        """
+        relevant_chunks = level1_results.get('relevant_chunks', {})
+        chunk_constraint_scores = level1_results.get('chunk_constraint_scores', {})
         
-        constraint_first_occurrence: Dict[str, int] = {}
-        constraint_violations: Dict[str, List[int]] = defaultdict(list)
+        valid_windows: Dict[str, Tuple[int, int]] = {}
+        temporal_violations: List[Dict] = []
+        constraint_timelines: Dict[str, List[float]] = {}
         
-        for chunk_idx, chunk in enumerate(story_chunks):
-            snapshot = self.tracker.process_story_chunk(chunk, chunk_idx)
-            
-            for constraint in constraints:
-                relevance = self._check_constraint_relevance(chunk, constraint)
-                
-                if relevance > 0.5:
-                    if constraint.text not in constraint_first_occurrence:
-                        constraint_first_occurrence[constraint.text] = chunk_idx
-                    
-                    if self._check_violation(snapshot, constraint):
-                        constraint_violations[constraint.text].append(chunk_idx)
-            
-            if chunk_idx % 100 == 0:
-                torch.cuda.empty_cache()
-        
-        temporal_scores = {}
         for constraint in constraints:
-            first_occurrence = constraint_first_occurrence.get(constraint.text, -1)
-            violations = constraint_violations[constraint.text]
+            constraint_text = constraint.text
+            relevant = relevant_chunks.get(constraint_text, [])
             
-            if first_occurrence >= 0 and violations:
-                early_violations = [v for v in violations if v < first_occurrence]
-                temporal_scores[constraint.text] = {
-                    'first_occurrence': first_occurrence,
-                    'violations': violations,
-                    'early_violations': early_violations,
-                    'consistent': len(early_violations) == 0,
-                }
-            else:
-                temporal_scores[constraint.text] = {
-                    'first_occurrence': first_occurrence,
-                    'violations': violations,
-                    'early_violations': [],
-                    'consistent': True,
-                }
+            if not relevant:
+                # Constraint never appears - could be a violation
+                valid_windows[constraint_text] = (-1, -1)
+                if constraint.polarity == 'positive':
+                    # Positive constraint should appear but doesn't
+                    temporal_violations.append({
+                        'constraint': constraint_text,
+                        'type': 'missing_positive_constraint',
+                        'expected_presence': True,
+                        'actual_presence': False,
+                        'severity': 0.7,
+                    })
+                continue
+            
+            # Find temporal window
+            first_occurrence = min(relevant)
+            last_occurrence = max(relevant)
+            valid_windows[constraint_text] = (first_occurrence, last_occurrence)
+            
+            # Build timeline of constraint strength
+            timeline = []
+            for snapshot in self.state_tracker.state_history:
+                chunk_idx = snapshot.chunk_idx
+                scores = chunk_constraint_scores.get(chunk_idx, {})
+                score = scores.get(constraint_text, 0.0)
+                timeline.append(score)
+            constraint_timelines[constraint_text] = timeline
+            
+            # Check for temporal violations
+            violations = self._check_temporal_violations(
+                constraint, timeline, first_occurrence, last_occurrence
+            )
+            temporal_violations.extend(violations)
         
-        consistent_count = sum(1 for s in temporal_scores.values() if s['consistent'])
-        total_count = len(temporal_scores) if temporal_scores else 1
-        temporal_alignment_score = consistent_count / total_count
+        # Compute alignment score
+        total_constraints = len(constraints)
+        violated_constraints = len(set(v['constraint'] for v in temporal_violations))
+        alignment_score = 1.0 - (violated_constraints / max(total_constraints, 1))
         
         return {
-            'temporal_scores': temporal_scores,
-            'alignment_score': temporal_alignment_score,
-            'events': temporal_events,
+            'valid_windows': valid_windows,
+            'temporal_violations': temporal_violations,
+            'constraint_timelines': constraint_timelines,
+            'alignment_score': alignment_score,
+            'violation_count': len(temporal_violations),
         }
     
-    def _check_constraint_relevance(self, chunk_tokens: torch.Tensor, constraint: Constraint) -> float:
-        return np.random.random() * 0.3
-    
-    def _check_violation(self, snapshot, constraint: Constraint) -> bool:
-        intensity = snapshot.constraint_signals.get('intensity', 0)
-        if constraint.polarity == 'negative' and intensity > 0.7:
-            return True
-        return False
+    def _check_temporal_violations(self, constraint: Constraint, 
+                                   timeline: List[float],
+                                   first_occ: int, last_occ: int) -> List[Dict]:
+        """Check for temporal violations in constraint timeline."""
+        violations = []
+        
+        if not timeline:
+            return violations
+        
+        # Violation 1: Negative constraint appears strongly before expected
+        if constraint.polarity == 'negative':
+            # Check if there's strong presence before first explicit mention
+            for idx, score in enumerate(timeline):
+                if idx < first_occ and score > 0.6:
+                    violations.append({
+                        'constraint': constraint.text,
+                        'type': 'early_negative_presence',
+                        'chunk_idx': idx,
+                        'score': score,
+                        'severity': 0.8,
+                    })
+        
+        # Violation 2: Positive constraint disappears after being established
+        if constraint.polarity == 'positive' and last_occ > first_occ:
+            window_avg = np.mean(timeline[first_occ:last_occ+1])
+            post_window = timeline[last_occ+1:] if last_occ+1 < len(timeline) else []
+            
+            if post_window:
+                post_avg = np.mean(post_window)
+                if post_avg < window_avg * 0.3:  # Significant drop
+                    violations.append({
+                        'constraint': constraint.text,
+                        'type': 'positive_constraint_fades',
+                        'window_avg': window_avg,
+                        'post_avg': post_avg,
+                        'severity': 0.6,
+                    })
+        
+        # Violation 3: Inconsistent presence (high variance)
+        if len(timeline) > 5:
+            variance = np.var(timeline)
+            if variance > 0.15:  # High variance indicates inconsistency
+                violations.append({
+                    'constraint': constraint.text,
+                    'type': 'inconsistent_presence',
+                    'variance': variance,
+                    'severity': 0.5,
+                })
+        
+        return violations
