@@ -17,7 +17,7 @@ app = modal.App("bdh-inference")
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu="A100",
     cpu=4,
     memory=32768,
     timeout=14400,  # 4 hours
