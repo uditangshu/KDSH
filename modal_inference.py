@@ -36,10 +36,10 @@ def run_inference(mode: str = "batch"):
     # Verify required files exist
     required_files = [
         "bdh.py",
-        "inference.py",
+        "main.py",
         "inference/__init__.py",  # Check modular package exists
-        "files/backstory.txt",
-        "files/novel.txt"
+        "files/albert_backstory.txt",
+        "files/kalam_novel.txt"
     ]
     
     print(f"Current working directory: {os.getcwd()}")
@@ -59,7 +59,7 @@ def run_inference(mode: str = "batch"):
     
     # Run the inference script
     # streaming stdout/stderr to the container logs
-    cmd = [sys.executable, "-u", "inference.py"]
+    cmd = [sys.executable, "-u", "main.py"]
     if mode == "stream":
         cmd.extend(["--mode", "stream"])
         
