@@ -43,8 +43,8 @@ def main():
             story_text = f.read()
     else:
         files_dir = os.path.join(os.path.dirname(__file__), "files")
-        backstory_path = os.path.join(files_dir, "backstory.txt")
-        novel_path = os.path.join(files_dir, "novel.txt")
+        backstory_path = os.path.join(files_dir, "albert_backstory.txt")
+        novel_path = os.path.join(files_dir, "kalam_novel.txt")
         
         with open(backstory_path, 'r', encoding='utf-8') as f:
             backstory_text = f.read()
