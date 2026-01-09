@@ -98,7 +98,7 @@ class Level3ConstraintViolation:
     
     def _analyze_semantic_violations(self, constraint: Constraint,
                                      constraint_emb: torch.Tensor,
-                                     valid_window: Tuple,
+                                     valid_window: tuple,
                                      chunk_scores: Dict) -> List[Dict]:
         """Analyze chunks for semantic constraint violations."""
         violations = []
