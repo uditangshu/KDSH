@@ -139,10 +139,19 @@ class Level3ConstraintViolation:
                                relevance: float) -> Dict:
         """Check if chunk semantically contradicts constraint."""
         
-        # Cosine similarity
-        similarity = F.cosine_similarity(
-            chunk_emb.unsqueeze(0), constraint_emb.unsqueeze(0), dim=1
-        ).item()
+        # Cosine similarity - Ensure tensors are on same device/CPU
+        # Level 3 logic runs on CPU, but chunk_emb might be GPU tensor if not careful
+        
+        # Ensure CPU
+        c_emb = chunk_emb.cpu()
+        k_emb = constraint_emb.cpu()
+        
+        # Manual cosine similarity for scalar result
+        dot_product = float(torch.dot(c_emb, k_emb))
+        norm_c = float(torch.norm(c_emb))
+        norm_k = float(torch.norm(k_emb))
+        
+        similarity = dot_product / (norm_c * norm_k + 1e-8)
         
         # Contradiction detection based on polarity
         is_contradiction = False
