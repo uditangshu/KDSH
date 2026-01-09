@@ -2,3 +2,4 @@ torch
 numpy
 requests
 modal
+pathway
