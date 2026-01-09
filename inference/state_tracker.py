@@ -1,4 +1,6 @@
-"""BDH State Tracker - Memory-safe state management."""
+"""BDH State Tracker - Memory-safe state management.
+OPTIMIZED: Reduced redundant computations and memory transfers.
+"""
 import torch
 import torch.nn.functional as F
 from typing import List, Optional, Dict
@@ -8,7 +10,7 @@ CHUNK_SIZE = 512
 
 
 class BDHStateTracker:
-    """Track BDH state as story is processed - MEMORY SAFE."""
+    """Track BDH state as story is processed - MEMORY SAFE & OPTIMIZED."""
     
     def __init__(self, model, config, device):
         self.model = model
@@ -32,20 +34,28 @@ class BDHStateTracker:
             sparsity = 0.0
             constraint_signals = {}
             
+            # Optimization: process larger chunks if possible, but keep CHUNK_SIZE for consistency
             for i in range(0, len(backstory_tokens), CHUNK_SIZE):
                 chunk = backstory_tokens[i:i+CHUNK_SIZE].unsqueeze(0).to(self.device)
-                _, hidden_state, _ = self._forward_pass(chunk)
                 
-                state_mean = hidden_state.mean(dim=(1, 2)).squeeze(0).cpu()
+                # Optimized forward pass returns only what's needed
+                hidden_state = self._forward_pass_light(chunk)
+                
+                # Compute stats on GPU before moving simple scalar/vector to CPU
+                state_mean = hidden_state.mean(dim=(1, 2)).squeeze(0) # Keep on GPU for a moment
                 state_norm = state_mean.norm().item()
                 sparsity = (hidden_state.abs() > 0.1).float().mean().item()
                 constraint_signals = self._extract_constraint_signals(hidden_state)
                 
+                current_summary_cpu = state_mean.cpu()
+                
                 del hidden_state
+                del state_mean
+                
                 if i % 50 == 0:
                     torch.cuda.empty_cache()
                 
-                current_summary = state_mean
+                current_summary = current_summary_cpu
             
             snapshot = StateSnapshot(
                 chunk_idx=-1,
@@ -66,25 +76,31 @@ class BDHStateTracker:
             if chunk_tokens.dim() == 1:
                 chunk_tokens = chunk_tokens.unsqueeze(0)
             
-            _, hidden_state, _ = self._forward_pass(chunk_tokens.to(self.device))
+            # Optimized forward pass
+            hidden_state = self._forward_pass_light(chunk_tokens.to(self.device))
             
-            state_mean = hidden_state.mean(dim=(1, 2)).squeeze(0).cpu()
-            state_norm = state_mean.norm().item()
+            # Compute GPU-side stats
+            state_mean_gpu = hidden_state.mean(dim=(1, 2)).squeeze(0)
+            state_norm = state_mean_gpu.norm().item()
             sparsity = (hidden_state.abs() > 0.1).float().mean().item()
+            
+            state_mean_cpu = state_mean_gpu.cpu()
             
             delta_norm = 0.0
             if self.previous_summary is not None:
-                delta_norm = (state_mean - self.previous_summary).norm().item()
+                delta_norm = (state_mean_cpu - self.previous_summary).norm().item()
             
             constraint_signals = self._extract_constraint_signals(hidden_state)
             
             del hidden_state
+            del state_mean_gpu
+            
             if chunk_idx % 100 == 0:
                 torch.cuda.empty_cache()
             
             snapshot = StateSnapshot(
                 chunk_idx=chunk_idx,
-                state_mean=state_mean,
+                state_mean=state_mean_cpu,
                 state_norm=state_norm,
                 sparsity=sparsity,
                 delta_norm=delta_norm,
@@ -92,12 +108,12 @@ class BDHStateTracker:
             )
             
             self.state_history.append(snapshot)
-            self.previous_summary = state_mean
+            self.previous_summary = state_mean_cpu
             
             return snapshot
     
-    def _forward_pass(self, tokens: torch.Tensor):
-        """Forward pass through BDH model."""
+    def _forward_pass_light(self, tokens: torch.Tensor):
+        """Optimized forward pass that skips logits calc if not needed."""
         C = self.config
         B, T = tokens.size()
         D = C.n_embd
@@ -127,8 +143,10 @@ class BDHStateTracker:
             y = self.model.ln(yMLP)
             x = self.model.ln(x + y)
         
-        logits = x.view(B, T, D) @ self.model.lm_head
-        return logits, x.detach(), None
+        # SKIP LOGITS calculation - saves matrix mult
+        # logits = x.view(B, T, D) @ self.model.lm_head
+        
+        return x.detach() # Only return hidden state
     
     def _extract_constraint_signals(self, hidden_state: torch.Tensor) -> Dict[str, float]:
         return {
