@@ -87,7 +87,7 @@ def main():
     print(f"\n{'='*60}")
     print("LEVEL 4: Causal Plausibility")
     print(f"  Plausibility Score: {results['level4']['plausibility_score']:.3f}")
-    print(f"  Implausible Jumps: {results['level4']['implausible_count']}")
+    print(f"  Implausible Jumps: {results['level4'].get('implausible_count', len(results['level4'].get('implausible_jumps', [])))}")
     
     # Pathway streaming report
     if 'pathway_report' in results:

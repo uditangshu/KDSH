@@ -79,6 +79,7 @@ class Level4CausalJustification:
             'plausibility_score': plausibility_score,
             'justified_count': len(justified_violations),
             'unjustified_count': unjustified_count,
+            'implausible_count': len(implausible_jumps),  # Added for main.py compatibility
         }
     
     def _check_causal_justification(self, chunk_idx: int, 
