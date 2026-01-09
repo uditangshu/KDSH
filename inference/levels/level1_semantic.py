@@ -54,24 +54,45 @@ class Level1SemanticRelevance:
 
         constraint_matrix = torch.stack([self.constraint_embeddings[c.text] for c in valid_constraints]).to(self.device)
         
-        # Compute cosine similarity matrix: [T_chunks, N_constraints]
-        sim_matrix = F.cosine_similarity(
-            chunk_embeddings.unsqueeze(1),  # [T_chunks, 1, D]
-            constraint_matrix.unsqueeze(0), # [1, N_constraints, D]
-            dim=2
-        )
+        # Compute cosine similarity in batches to avoid OOM
+        # chunk_embeddings: [T_chunks, D]
+        # constraint_matrix: [N_constraints, D]
+        
+        num_chunks = chunk_embeddings.size(0)
+        BATCH_SIZE = 1000  # Adjust based on memory
+        scores_list = []
         
         # Compute boost factors [N_constraints]
         boosts = torch.tensor([
             self._get_category_boost(c.category) for c in valid_constraints
         ], device=self.device)
         
-        # Apply boosts and normalization
-        scores_matrix = ((sim_matrix + 1) / 2) * boosts.unsqueeze(0)
-        scores_matrix = torch.clamp(scores_matrix, max=1.0)
-        
-        # Convert to results structure
-        scores_cpu = scores_matrix.cpu().numpy()
+        for i in range(0, num_chunks, BATCH_SIZE):
+            chunk_batch = chunk_embeddings[i:i+BATCH_SIZE]  # [B, D]
+            
+            # [B, 1, D] vs [1, N, D] -> [B, N]
+            sim_batch = F.cosine_similarity(
+                chunk_batch.unsqueeze(1),
+                constraint_matrix.unsqueeze(0),
+                dim=2
+            )
+            
+            # Apply boosts and normalization immediately to save memory
+            scores_batch = ((sim_batch + 1) / 2) * boosts.unsqueeze(0)
+            scores_batch = torch.clamp(scores_batch, max=1.0)
+            
+            # Move to CPU immediately
+            scores_list.append(scores_batch.cpu())
+            
+        # Concatenate all results on CPU
+        if scores_list:
+            scores_cpu = torch.cat(scores_list, dim=0).numpy()
+        else:
+            scores_cpu = np.array([])
+            
+        # scores_matrix for alignment score calculation (approximate or re-mean)
+        # We can just use the CPU scores for the mean
+        alignment_score = float(np.mean(scores_cpu)) if scores_cpu.size > 0 else 0.5
         
         for i, snapshot in enumerate(self.state_tracker.state_history):
             chunk_idx = snapshot.chunk_idx
@@ -86,8 +107,7 @@ class Level1SemanticRelevance:
             
             chunk_constraint_scores[chunk_idx] = chunk_scores
         
-        # Compute alignment score
-        alignment_score = float(scores_matrix.mean().item())
+
         
         return {
             'relevant_chunks': relevant_chunks,
